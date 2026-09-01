@@ -49,7 +49,7 @@
 </head>
 <body>
 <div id="root"></div>
-<script type="text/babel" data-presets="react">
+<script type="text/plain" id="app-source">
 const { useState, useEffect, useMemo } = React;
 
 /* ============================================================
@@ -824,6 +824,19 @@ const CSS = `
 
 const root = ReactDOM.createRoot(document.getElementById('root'));
 root.render(<TimeCircuitsCalendar />);
+</script>
+<script>
+  (function () {
+    var source = document.getElementById('app-source').textContent;
+    var compiled = Babel.transform(source, {
+      presets: [['react', { runtime: 'classic' }]],
+      sourceType: 'script',
+      filename: 'app.jsx',
+    }).code;
+    var script = document.createElement('script');
+    script.text = compiled;
+    document.body.appendChild(script);
+  })();
 </script>
 </body>
 </html>

@@ -1,4 +1,4 @@
-<!DOCTYPE html>
+<<!DOCTYPE html>
 <!--
   TIME CIRCUITS CALENDAR — versión standalone con Google Calendar real
   ======================================================================
@@ -340,24 +340,34 @@ function TimeCircuitsCalendar() {
         }
 
         try {
-          const tasksUrl = 'https://www.googleapis.com/tasks/v1/lists/@default/tasks'
-            + '?dueMin=' + encodeURIComponent(timeMin)
-            + '&dueMax=' + encodeURIComponent(timeMax)
-            + '&showCompleted=false&maxResults=100';
-          const res2 = await fetch(tasksUrl, { headers: authHeader });
-          if (!res2.ok) {
-            const bodyText2 = await res2.text().catch(() => '');
-            throw new Error('Tasks HTTP ' + res2.status + (bodyText2 ? ' — ' + bodyText2.slice(0, 140) : ''));
+          const listsRes = await fetch('https://www.googleapis.com/tasks/v1/users/@me/lists?maxResults=100', {
+            headers: authHeader,
+          });
+          if (!listsRes.ok) {
+            const bodyTextL = await listsRes.text().catch(() => '');
+            throw new Error('Tasks (listas) HTTP ' + listsRes.status + (bodyTextL ? ' — ' + bodyTextL.slice(0, 140) : ''));
           }
-          const data2 = await res2.json();
-          mappedTasks = (data2.items || [])
-            .filter((t) => t.due && t.status !== 'completed')
+          const listsData = await listsRes.json();
+          const taskLists = (listsData.items && listsData.items.length) ? listsData.items : [{ id: '@default' }];
+
+          let allTaskItems = [];
+          for (const list of taskLists) {
+            const tasksUrl = 'https://www.googleapis.com/tasks/v1/lists/' + encodeURIComponent(list.id) + '/tasks'
+              + '?showCompleted=false&showHidden=false&maxResults=100';
+            const resT = await fetch(tasksUrl, { headers: authHeader });
+            if (!resT.ok) continue;
+            const dataT = await resT.json();
+            allTaskItems = allTaskItems.concat(dataT.items || []);
+          }
+
+          mappedTasks = allTaskItems
+            .filter((t) => t.status !== 'completed')
             .map((t, i) => {
-              const dt = new Date(t.due);
+              const dt = t.due ? new Date(t.due) : null;
               return {
                 id: 'gt-' + (t.id || i),
                 title: t.title || '(Sin título)',
-                date: formatDateKey(dt),
+                date: dt ? formatDateKey(dt) : null,
                 time: null,
                 source: 'google-task',
               };
@@ -393,6 +403,10 @@ function TimeCircuitsCalendar() {
   const timedEvents = useMemo(
     () => todaysEvents.filter((e) => e.time).sort((a, b) => a.time.localeCompare(b.time)),
     [todaysEvents]
+  );
+  const undatedTasks = useMemo(
+    () => combinedEvents.filter((e) => e.source === 'google-task' && !e.date),
+    [combinedEvents]
   );
 
   const nextEvent = useMemo(() => {
@@ -517,6 +531,15 @@ function TimeCircuitsCalendar() {
             <EventRow key={ev.id} ev={ev} onClick={() => openEditModal(ev)} />
           ))}
         </div>
+
+        {undatedTasks.length > 0 && (
+          <div className="tc-card__section tc-card__section--seam">
+            <div className="tc-card__title">TAREAS SIN FECHA</div>
+            {undatedTasks.map((ev) => (
+              <EventRow key={ev.id} ev={ev} onClick={undefined} />
+            ))}
+          </div>
+        )}
 
         <div className="tc-card__section tc-card__section--seam">
           <div className="tc-card__title">PRÓXIMO EVENTO</div>

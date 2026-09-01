@@ -19,6 +19,7 @@
   CONFIGURACIÓN EN GOOGLE CLOUD CONSOLE (una sola vez):
     1. https://console.cloud.google.com/ → crea un proyecto
     2. "APIs y servicios" → "Biblioteca" → busca y activa "Google Calendar API"
+       → busca y activa también "Tasks API" (para traer tus tareas de Google Tasks)
     3. "APIs y servicios" → "Pantalla de consentimiento OAuth"
        → Externo → completa nombre de la app y tu correo
        → en "Scopes" agrega: https://www.googleapis.com/auth/calendar.readonly
@@ -56,7 +57,7 @@ const { useState, useEffect, useMemo } = React;
    ⚙️ CONFIGURA ESTO ANTES DE USAR — ver instrucciones arriba
    ============================================================ */
 const GOOGLE_CLIENT_ID = '748833608336-lunfiek9rnhcige00hgm2a9vp5p3dvce.apps.googleusercontent.com';
-const CALENDAR_SCOPE = 'https://www.googleapis.com/auth/calendar.readonly';
+const GOOGLE_SCOPES = 'https://www.googleapis.com/auth/calendar.readonly https://www.googleapis.com/auth/tasks.readonly';
 
 const MESES = ['JAN', 'FEB', 'MAR', 'APR', 'MAY', 'JUN', 'JUL', 'AUG', 'SEP', 'OCT', 'NOV', 'DEC'];
 const FIELD_LABELS = { month: 'MES', day: 'DÍA', year: 'AÑO', hour: 'HORA', minute: 'MIN', ampm: 'AM/PM' };
@@ -189,16 +190,19 @@ function TimeDisplay({ date, editable, selectedField, onSelectField, blinkColon 
 }
 
 function EventRow({ ev, onClick }) {
-  const isGoogle = ev.source === 'google';
+  const isEvent = ev.source === 'google-event' || ev.source === 'google';
+  const isTask = ev.source === 'google-task';
+  const readOnly = isEvent || isTask;
   return (
     <button
       type="button"
-      className={`tc-event-row${isGoogle ? ' tc-event-row--google' : ''}`}
-      onClick={isGoogle ? undefined : onClick}
+      className={`tc-event-row${readOnly ? ' tc-event-row--google' : ''}`}
+      onClick={readOnly ? undefined : onClick}
     >
       <span className="tc-event-row__time">{formatEventTime(ev.time)}</span>
       <span className="tc-event-row__title">{ev.title}</span>
-      {isGoogle && <span className="tc-event-row__badge">G</span>}
+      {isEvent && <span className="tc-event-row__badge">CAL</span>}
+      {isTask && <span className="tc-event-row__badge tc-event-row__badge--task">TAREA</span>}
     </button>
   );
 }
@@ -292,48 +296,88 @@ function TimeCircuitsCalendar() {
 
     const tokenClient = window.google.accounts.oauth2.initTokenClient({
       client_id: GOOGLE_CLIENT_ID,
-      scope: CALENDAR_SCOPE,
+      scope: GOOGLE_SCOPES,
       callback: async (tokenResponse) => {
         if (!tokenResponse || tokenResponse.error) {
           setSyncStatus('error');
           setSyncError('Google rechazó el acceso: ' + (tokenResponse && tokenResponse.error ? tokenResponse.error : 'desconocido'));
           return;
         }
+        const authHeader = { Authorization: 'Bearer ' + tokenResponse.access_token };
+        const year = destination.getFullYear();
+        const month = destination.getMonth();
+        const timeMin = new Date(year, month, 1).toISOString();
+        const timeMax = new Date(year, month + 1, 0, 23, 59, 59).toISOString();
+        const problems = [];
+        let mappedEvents = [];
+        let mappedTasks = [];
+
         try {
-          const year = destination.getFullYear();
-          const month = destination.getMonth();
-          const timeMin = new Date(year, month, 1).toISOString();
-          const timeMax = new Date(year, month + 1, 0, 23, 59, 59).toISOString();
           const url = 'https://www.googleapis.com/calendar/v3/calendars/primary/events'
             + '?timeMin=' + encodeURIComponent(timeMin)
             + '&timeMax=' + encodeURIComponent(timeMax)
             + '&singleEvents=true&orderBy=startTime&maxResults=250';
-          const res = await fetch(url, {
-            headers: { Authorization: 'Bearer ' + tokenResponse.access_token },
-          });
+          const res = await fetch(url, { headers: authHeader });
           if (!res.ok) {
             const bodyText = await res.text().catch(() => '');
-            throw new Error('Google API HTTP ' + res.status + (bodyText ? ' — ' + bodyText.slice(0, 160) : ''));
+            throw new Error('Calendar HTTP ' + res.status + (bodyText ? ' — ' + bodyText.slice(0, 140) : ''));
           }
           const data = await res.json();
-          const mapped = (data.items || []).map((item, i) => {
+          mappedEvents = (data.items || []).map((item, i) => {
             const isAllDay = !item.start || !item.start.dateTime;
             const startRaw = item.start ? (item.start.dateTime || item.start.date) : null;
             const dt = startRaw ? new Date(startRaw) : new Date();
             return {
-              id: 'g-' + (item.id || i),
+              id: 'ge-' + (item.id || i),
               title: item.summary || '(Sin título)',
               date: formatDateKey(dt),
               time: isAllDay ? null : `${pad2(dt.getHours())}:${pad2(dt.getMinutes())}`,
-              source: 'google',
+              source: 'google-event',
             };
           });
-          setGoogleEvents(mapped);
-          setLastSync(new Date());
-          setSyncStatus('ok');
         } catch (e) {
+          problems.push('Eventos: ' + (e && e.message ? e.message : 'error desconocido'));
+        }
+
+        try {
+          const tasksUrl = 'https://www.googleapis.com/tasks/v1/lists/@default/tasks'
+            + '?dueMin=' + encodeURIComponent(timeMin)
+            + '&dueMax=' + encodeURIComponent(timeMax)
+            + '&showCompleted=false&maxResults=100';
+          const res2 = await fetch(tasksUrl, { headers: authHeader });
+          if (!res2.ok) {
+            const bodyText2 = await res2.text().catch(() => '');
+            throw new Error('Tasks HTTP ' + res2.status + (bodyText2 ? ' — ' + bodyText2.slice(0, 140) : ''));
+          }
+          const data2 = await res2.json();
+          mappedTasks = (data2.items || [])
+            .filter((t) => t.due && t.status !== 'completed')
+            .map((t, i) => {
+              const dt = new Date(t.due);
+              return {
+                id: 'gt-' + (t.id || i),
+                title: t.title || '(Sin título)',
+                date: formatDateKey(dt),
+                time: null,
+                source: 'google-task',
+              };
+            });
+        } catch (e) {
+          problems.push('Tareas: ' + (e && e.message ? e.message : 'error desconocido'));
+        }
+
+        setGoogleEvents([...mappedEvents, ...mappedTasks]);
+        setLastSync(new Date());
+        if (problems.length === 2) {
           setSyncStatus('error');
-          setSyncError('Error al leer eventos: ' + (e && e.message ? e.message : 'desconocido'));
+          setSyncError(problems.join(' · '));
+        } else if (problems.length === 1) {
+          setSyncStatus('ok');
+          setSyncError('');
+          // sincronización parcial: una de las dos fuentes falló pero se muestra la otra
+          console.warn('Sincronización parcial:', problems[0]);
+        } else {
+          setSyncStatus('ok');
         }
       },
     });
@@ -747,6 +791,10 @@ const CSS = `
   border-radius: 3px;
   padding: 0 4px;
   flex-shrink: 0;
+}
+.tc-event-row__badge--task {
+  color: #ffcf8a;
+  border-color: #7a5a30;
 }
 
 /* ---- Tarjeta única: eventos + próximo evento ---- */

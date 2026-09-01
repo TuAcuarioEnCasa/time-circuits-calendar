@@ -1,4 +1,4 @@
-<<!DOCTYPE html>
+<!DOCTYPE html>
 <!--
   TIME CIRCUITS CALENDAR — versión standalone con Google Calendar real
   ======================================================================
@@ -72,6 +72,14 @@ function daysInMonth(year, month) {
 
 function formatDateKey(d) {
   return `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())}`;
+}
+
+// Google codifica fechas "solo fecha" (eventos todo el día, vencimientos de tareas)
+// como medianoche UTC. Si las leemos con getters locales, en husos horarios detrás
+// de UTC (América, por ejemplo) el día se recorre uno hacia atrás. Por eso estas
+// fechas se leen siempre con los getters UTC, nunca con los locales.
+function formatDateKeyFromUTC(d) {
+  return `${d.getUTCFullYear()}-${pad2(d.getUTCMonth() + 1)}-${pad2(d.getUTCDate())}`;
 }
 
 function to12h(hour24) {
@@ -330,7 +338,7 @@ function TimeCircuitsCalendar() {
             return {
               id: 'ge-' + (item.id || i),
               title: item.summary || '(Sin título)',
-              date: formatDateKey(dt),
+              date: isAllDay ? formatDateKeyFromUTC(dt) : formatDateKey(dt),
               time: isAllDay ? null : `${pad2(dt.getHours())}:${pad2(dt.getMinutes())}`,
               source: 'google-event',
             };
@@ -367,7 +375,7 @@ function TimeCircuitsCalendar() {
               return {
                 id: 'gt-' + (t.id || i),
                 title: t.title || '(Sin título)',
-                date: dt ? formatDateKey(dt) : null,
+                date: dt ? formatDateKeyFromUTC(dt) : null,
                 time: null,
                 source: 'google-task',
               };

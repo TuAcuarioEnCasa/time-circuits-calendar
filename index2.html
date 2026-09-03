@@ -1,0 +1,967 @@
+<!DOCTYPE html>
+<!--
+  TIME CIRCUITS CALENDAR — versión standalone con Google Calendar real
+  ======================================================================
+  ESTE ARCHIVO NO FUNCIONA SI LO ABRES CON DOBLE CLIC (file://).
+  Google exige que la página se sirva por http:// o https://. Dos formas
+  rápidas y gratis de lograrlo:
+
+    A) Netlify Drop (sin cuenta, más rápido para probar hoy):
+       1. Ve a https://app.netlify.com/drop
+       2. Arrastra esta carpeta/archivo
+       3. Te da una URL https://algo.netlify.app — esa es tu "origin"
+
+    B) GitHub Pages (si ya tienes cuenta de GitHub, mejor a largo plazo):
+       1. Crea un repo, sube este archivo como index.html
+       2. Settings → Pages → actívalo en la rama main
+       3. Te da una URL https://tuusuario.github.io/turepo/
+
+  CONFIGURACIÓN EN GOOGLE CLOUD CONSOLE (una sola vez):
+    1. https://console.cloud.google.com/ → crea un proyecto
+    2. "APIs y servicios" → "Biblioteca" → busca y activa "Google Calendar API"
+       → busca y activa también "Tasks API" (para traer tus tareas de Google Tasks)
+    3. "APIs y servicios" → "Pantalla de consentimiento OAuth"
+       → Externo → completa nombre de la app y tu correo
+       → en "Scopes" agrega: https://www.googleapis.com/auth/calendar.readonly
+       → en "Test users" agrégate a ti mismo (tu correo de Gmail)
+    4. "APIs y servicios" → "Credenciales" → "Crear credenciales"
+       → "ID de cliente de OAuth" → Tipo: "Aplicación web"
+       → en "Orígenes autorizados de JavaScript" pega la URL de arriba
+         (ej. https://algo.netlify.app) — SIN barra final, sin /callback
+       → Crear. Copia el Client ID (termina en .apps.googleusercontent.com)
+    5. Pega ese Client ID abajo en GOOGLE_CLIENT_ID (buscar en este archivo)
+
+  Mientras el consent screen esté en modo "Testing", solo las cuentas que
+  agregues como "Test users" podrán conectarse (perfecto para uso personal).
+-->
+<html lang="es">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0" />
+<title>Time Circuits Calendar</title>
+<script src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+<script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+<script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+<script src="https://accounts.google.com/gsi/client" async defer></script>
+<style>
+  html, body { margin: 0; padding: 0; background: #0b0c0d; }
+  #root { min-height: 100vh; }
+</style>
+</head>
+<body>
+<div id="root"></div>
+<script type="text/plain" id="app-source">
+const { useState, useEffect, useMemo } = React;
+
+/* ============================================================
+   ⚙️ CONFIGURA ESTO ANTES DE USAR — ver instrucciones arriba
+   ============================================================ */
+const GOOGLE_CLIENT_ID = 'TU_CLIENT_ID_AQUI.apps.googleusercontent.com';
+const GOOGLE_SCOPES = 'https://www.googleapis.com/auth/calendar.readonly https://www.googleapis.com/auth/tasks.readonly';
+
+const MESES = ['JAN', 'FEB', 'MAR', 'APR', 'MAY', 'JUN', 'JUL', 'AUG', 'SEP', 'OCT', 'NOV', 'DEC'];
+const FIELD_LABELS = { month: 'MES', day: 'DÍA', year: 'AÑO', hour: 'HORA', minute: 'MIN', ampm: 'AM/PM' };
+
+function pad2(n) {
+  return String(n).padStart(2, '0');
+}
+
+function daysInMonth(year, month) {
+  return new Date(year, month + 1, 0).getDate();
+}
+
+function formatDateKey(d) {
+  return `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())}`;
+}
+
+// Google codifica fechas "solo fecha" (eventos todo el día, vencimientos de tareas)
+// como medianoche UTC. Si las leemos con getters locales, en husos horarios detrás
+// de UTC (América, por ejemplo) el día se recorre uno hacia atrás. Por eso estas
+// fechas se leen siempre con los getters UTC, nunca con los locales.
+function formatDateKeyFromUTC(d) {
+  return `${d.getUTCFullYear()}-${pad2(d.getUTCMonth() + 1)}-${pad2(d.getUTCDate())}`;
+}
+
+function to12h(hour24) {
+  const h = hour24 % 12;
+  return h === 0 ? 12 : h;
+}
+
+function formatEventTime(timeStr) {
+  if (!timeStr) return 'TODO EL DÍA';
+  const [h, m] = timeStr.split(':').map(Number);
+  const ampm = h >= 12 ? 'PM' : 'AM';
+  return `${pad2(to12h(h))}:${pad2(m)} ${ampm}`;
+}
+
+function formatTaskDate(dateKey) {
+  if (!dateKey) return 'SIN FECHA';
+  const [y, m, d] = dateKey.split('-').map(Number);
+  return `${pad2(d)} ${MESES[m - 1]}`;
+}
+
+function uid() {
+  return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+}
+
+function loadJSON(key, fallback) {
+  try {
+    const raw = localStorage.getItem(key);
+    return raw ? JSON.parse(raw) : fallback;
+  } catch (e) {
+    return fallback;
+  }
+}
+
+function saveJSON(key, value) {
+  try {
+    localStorage.setItem(key, JSON.stringify(value));
+  } catch (e) {
+    // almacenamiento no disponible; se ignora
+  }
+}
+
+function Console({ children }) {
+  return (
+    <div className="tc-console">
+      <span className="tc-screw tc-screw--tl" />
+      <span className="tc-screw tc-screw--tr" />
+      <span className="tc-screw tc-screw--bl" />
+      <span className="tc-screw tc-screw--br" />
+      {children}
+    </div>
+  );
+}
+
+function ConsoleSection({ label, colorClass, seam, children }) {
+  return (
+    <div className={`tc-console__section tc-panel--${colorClass}${seam ? ' tc-console__section--seam' : ''}`}>
+      <div className="tc-console__row">{children}</div>
+      <div className="tc-console__title">{label}</div>
+    </div>
+  );
+}
+
+function FieldModule({ labelText, value, selected, onClick, interactive }) {
+  return (
+    <div className="tc-module">
+      <span className="tc-module__label">{labelText}</span>
+      <span
+        className={`tc-module__value${selected ? ' tc-module__value--selected' : ''}${interactive ? ' tc-module__value--interactive' : ''}`}
+        onClick={interactive ? onClick : undefined}
+        role={interactive ? 'button' : undefined}
+        tabIndex={interactive ? 0 : undefined}
+      >
+        <span className="tc-glyph">{value}</span>
+      </span>
+    </div>
+  );
+}
+
+function AmPmModule({ isPm, onClick, interactive }) {
+  return (
+    <div
+      className={`tc-ampm-module${interactive ? ' tc-ampm-module--interactive' : ''}`}
+      onClick={interactive ? onClick : undefined}
+      role={interactive ? 'button' : undefined}
+      tabIndex={interactive ? 0 : undefined}
+    >
+      <div className="tc-ampm-module__row">
+        <span className={`tc-lamp${!isPm ? ' tc-lamp--lit' : ''}`} />
+        <span className="tc-ampm-module__text">AM</span>
+      </div>
+      <div className="tc-ampm-module__row">
+        <span className={`tc-lamp${isPm ? ' tc-lamp--lit' : ''}`} />
+        <span className="tc-ampm-module__text">PM</span>
+      </div>
+    </div>
+  );
+}
+
+function ClockColon({ blink }) {
+  return (
+    <div className="tc-clock-colon">
+      <span className={`tc-dot${blink ? ' tc-dot--blink' : ''}`} />
+      <span className={`tc-dot${blink ? ' tc-dot--blink' : ''}`} />
+    </div>
+  );
+}
+
+function TimeDisplay({ date, editable, selectedField, onSelectField, blinkColon }) {
+  const hour12 = to12h(date.getHours());
+  const isPm = date.getHours() >= 12;
+  return (
+    <>
+      <FieldModule labelText="MONTH" value={MESES[date.getMonth()]} selected={selectedField === 'month'} interactive={editable} onClick={() => onSelectField('month')} />
+      <FieldModule labelText="DAY" value={pad2(date.getDate())} selected={selectedField === 'day'} interactive={editable} onClick={() => onSelectField('day')} />
+      <FieldModule labelText="YEAR" value={date.getFullYear()} selected={selectedField === 'year'} interactive={editable} onClick={() => onSelectField('year')} />
+      <AmPmModule isPm={isPm} interactive={editable} onClick={() => onSelectField('ampm')} />
+      <FieldModule labelText="HOUR" value={pad2(hour12)} selected={selectedField === 'hour'} interactive={editable} onClick={() => onSelectField('hour')} />
+      <ClockColon blink={blinkColon} />
+      <FieldModule labelText="MIN" value={pad2(date.getMinutes())} selected={selectedField === 'minute'} interactive={editable} onClick={() => onSelectField('minute')} />
+    </>
+  );
+}
+
+function EventRow({ ev, onClick }) {
+  const isEvent = ev.source === 'google-event' || ev.source === 'google';
+  const readOnly = isEvent;
+  return (
+    <button
+      type="button"
+      className={`tc-event-row${readOnly ? ' tc-event-row--google' : ''}`}
+      onClick={readOnly ? undefined : onClick}
+    >
+      <span className="tc-event-row__time">{formatEventTime(ev.time)}</span>
+      <span className="tc-event-row__title">{ev.title}</span>
+      {isEvent && <span className="tc-event-row__badge">CAL</span>}
+    </button>
+  );
+}
+
+function TaskRow({ task }) {
+  return (
+    <div className="tc-event-row tc-event-row--google">
+      <span className="tc-event-row__time">{formatTaskDate(task.date)}</span>
+      <span className="tc-event-row__title">{task.title}</span>
+      <span className="tc-event-row__badge tc-event-row__badge--task">TAREA</span>
+    </div>
+  );
+}
+
+const EMPTY_MODAL = { open: false, mode: 'add', id: null, title: '', date: '', time: '09:00', allDay: false };
+
+function TimeCircuitsCalendar() {
+  const [now, setNow] = useState(new Date());
+  const [destination, setDestination] = useState(new Date());
+  const [lastDeparted, setLastDeparted] = useState(() => {
+    const raw = localStorage.getItem('tc_last_departed');
+    const d = raw ? new Date(raw) : new Date(Date.now() - 86400000);
+    return isNaN(d.getTime()) ? new Date(Date.now() - 86400000) : d;
+  });
+  const [selectedField, setSelectedField] = useState('day');
+  const [events, setEvents] = useState(() => loadJSON('tc_events', []));
+  const [modal, setModal] = useState(EMPTY_MODAL);
+  const [googleEvents, setGoogleEvents] = useState(() => loadJSON('tc_google_events', []));
+  const [syncStatus, setSyncStatus] = useState('idle');
+  const [syncError, setSyncError] = useState('');
+  const [lastSync, setLastSync] = useState(() => {
+    const raw = localStorage.getItem('tc_last_sync');
+    return raw ? new Date(raw) : null;
+  });
+
+  useEffect(() => {
+    const id = setInterval(() => setNow(new Date()), 1000);
+    return () => clearInterval(id);
+  }, []);
+
+  useEffect(() => { saveJSON('tc_events', events); }, [events]);
+  useEffect(() => { localStorage.setItem('tc_last_departed', lastDeparted.toISOString()); }, [lastDeparted]);
+  useEffect(() => { saveJSON('tc_google_events', googleEvents); }, [googleEvents]);
+  useEffect(() => { if (lastSync) localStorage.setItem('tc_last_sync', lastSync.toISOString()); }, [lastSync]);
+
+  function commitDestinationChange(next) {
+    if (next.getTime() !== destination.getTime()) {
+      setLastDeparted(destination);
+      setDestination(next);
+    }
+  }
+
+  function adjustField(field, delta) {
+    let year = destination.getFullYear();
+    let month = destination.getMonth();
+    let day = destination.getDate();
+    let hour = destination.getHours();
+    let minute = destination.getMinutes();
+
+    if (field === 'year') {
+      year += delta;
+      day = Math.min(day, daysInMonth(year, month));
+    } else if (field === 'month') {
+      month += delta;
+      while (month < 0) { month += 12; year -= 1; }
+      while (month > 11) { month -= 12; year += 1; }
+      day = Math.min(day, daysInMonth(year, month));
+    } else if (field === 'day') {
+      const tmp = new Date(year, month, day + delta, hour, minute);
+      year = tmp.getFullYear(); month = tmp.getMonth(); day = tmp.getDate();
+      hour = tmp.getHours(); minute = tmp.getMinutes();
+    } else if (field === 'hour') {
+      hour += delta;
+    } else if (field === 'minute') {
+      minute += delta;
+    } else if (field === 'ampm') {
+      hour += 12;
+    }
+
+    commitDestinationChange(new Date(year, month, day, hour, minute, 0, 0));
+  }
+
+  function goToday() {
+    commitDestinationChange(new Date());
+  }
+
+  /* ---------- Google Calendar real, vía Google Identity Services ---------- */
+  function syncGoogleCalendar() {
+    if (!GOOGLE_CLIENT_ID || GOOGLE_CLIENT_ID.indexOf('TU_CLIENT_ID') !== -1) {
+      setSyncStatus('error');
+      setSyncError('Falta configurar GOOGLE_CLIENT_ID en este archivo (ver instrucciones al inicio).');
+      return;
+    }
+    if (!window.google || !window.google.accounts || !window.google.accounts.oauth2) {
+      setSyncStatus('error');
+      setSyncError('La librería de Google todavía no cargó. Espera un segundo y vuelve a intentar.');
+      return;
+    }
+    setSyncStatus('loading');
+    setSyncError('');
+
+    const tokenClient = window.google.accounts.oauth2.initTokenClient({
+      client_id: GOOGLE_CLIENT_ID,
+      scope: GOOGLE_SCOPES,
+      callback: async (tokenResponse) => {
+        if (!tokenResponse || tokenResponse.error) {
+          setSyncStatus('error');
+          setSyncError('Google rechazó el acceso: ' + (tokenResponse && tokenResponse.error ? tokenResponse.error : 'desconocido'));
+          return;
+        }
+        const authHeader = { Authorization: 'Bearer ' + tokenResponse.access_token };
+        const year = destination.getFullYear();
+        const month = destination.getMonth();
+        const timeMin = new Date(year, month, 1).toISOString();
+        const timeMax = new Date(year, month + 1, 0, 23, 59, 59).toISOString();
+        const problems = [];
+        let mappedEvents = [];
+        let mappedTasks = [];
+        let taskListCount = 0;
+        let taskListNames = '';
+        let rawTaskCount = 0;
+
+        try {
+          const url = 'https://www.googleapis.com/calendar/v3/calendars/primary/events'
+            + '?timeMin=' + encodeURIComponent(timeMin)
+            + '&timeMax=' + encodeURIComponent(timeMax)
+            + '&singleEvents=true&orderBy=startTime&maxResults=250';
+          const res = await fetch(url, { headers: authHeader });
+          if (!res.ok) {
+            const bodyText = await res.text().catch(() => '');
+            throw new Error('Calendar HTTP ' + res.status + (bodyText ? ' — ' + bodyText.slice(0, 140) : ''));
+          }
+          const data = await res.json();
+          mappedEvents = (data.items || []).map((item, i) => {
+            const isAllDay = !item.start || !item.start.dateTime;
+            const startRaw = item.start ? (item.start.dateTime || item.start.date) : null;
+            const dt = startRaw ? new Date(startRaw) : new Date();
+            return {
+              id: 'ge-' + (item.id || i),
+              title: item.summary || '(Sin título)',
+              date: isAllDay ? formatDateKeyFromUTC(dt) : formatDateKey(dt),
+              time: isAllDay ? null : `${pad2(dt.getHours())}:${pad2(dt.getMinutes())}`,
+              source: 'google-event',
+            };
+          });
+        } catch (e) {
+          problems.push('Eventos: ' + (e && e.message ? e.message : 'error desconocido'));
+        }
+
+        try {
+          let allLists = [];
+          let listsPageToken = '';
+          do {
+            const listsUrl = 'https://www.googleapis.com/tasks/v1/users/@me/lists?maxResults=100'
+              + (listsPageToken ? '&pageToken=' + encodeURIComponent(listsPageToken) : '');
+            const listsRes = await fetch(listsUrl, { headers: authHeader });
+            if (!listsRes.ok) {
+              const bodyTextL = await listsRes.text().catch(() => '');
+              throw new Error('Tasks (listas) HTTP ' + listsRes.status + (bodyTextL ? ' — ' + bodyTextL.slice(0, 140) : ''));
+            }
+            const listsData = await listsRes.json();
+            allLists = allLists.concat(listsData.items || []);
+            listsPageToken = listsData.nextPageToken || '';
+          } while (listsPageToken);
+
+          const taskLists = allLists.length ? allLists : [{ id: '@default', title: 'default' }];
+          taskListCount = taskLists.length;
+          taskListNames = taskLists.map((l) => l.title || l.id).join(', ');
+
+          let allTaskItems = [];
+          for (const list of taskLists) {
+            let tasksPageToken = '';
+            do {
+              const tasksUrl = 'https://www.googleapis.com/tasks/v1/lists/' + encodeURIComponent(list.id) + '/tasks'
+                + '?showCompleted=false&showHidden=false&maxResults=100'
+                + (tasksPageToken ? '&pageToken=' + encodeURIComponent(tasksPageToken) : '');
+              const resT = await fetch(tasksUrl, { headers: authHeader });
+              if (!resT.ok) break;
+              const dataT = await resT.json();
+              allTaskItems = allTaskItems.concat(dataT.items || []);
+              tasksPageToken = dataT.nextPageToken || '';
+            } while (tasksPageToken);
+          }
+
+          rawTaskCount = allTaskItems.length;
+
+          mappedTasks = allTaskItems
+            .filter((t) => t.status !== 'completed')
+            .map((t, i) => {
+              const dt = t.due ? new Date(t.due) : null;
+              return {
+                id: 'gt-' + (t.id || i),
+                title: t.title || '(Sin título)',
+                date: dt ? formatDateKeyFromUTC(dt) : null,
+                time: null,
+                source: 'google-task',
+              };
+            });
+        } catch (e) {
+          problems.push('Tareas: ' + (e && e.message ? e.message : 'error desconocido'));
+        }
+
+        setGoogleEvents([...mappedEvents, ...mappedTasks]);
+        setLastSync(new Date());
+        const summary = `${mappedEvents.length} evento(s), ${mappedTasks.length}/${rawTaskCount} tarea(s) en ${taskListCount} lista(s): ${taskListNames}`;
+        if (problems.length === 2) {
+          setSyncStatus('error');
+          setSyncError(problems.join(' · '));
+        } else if (problems.length === 1) {
+          setSyncStatus('ok');
+          setSyncError('Aviso: ' + problems[0] + ' — ' + summary);
+        } else {
+          setSyncStatus('ok');
+          setSyncError('Última sincronización trajo: ' + summary);
+        }
+      },
+    });
+
+    tokenClient.requestAccessToken();
+  }
+
+  const destKey = formatDateKey(destination);
+  const combinedEvents = useMemo(() => [...events, ...googleEvents], [events, googleEvents]);
+
+  // Los eventos (locales + Calendar) son del día que se está navegando.
+  // Las tareas de Google NO participan aquí: viven en su propia lista siempre visible.
+  const dayEvents = useMemo(
+    () => combinedEvents.filter((e) => e.source !== 'google-task'),
+    [combinedEvents]
+  );
+  const todaysEvents = useMemo(() => dayEvents.filter((e) => e.date === destKey), [dayEvents, destKey]);
+  const allDayEvents = useMemo(() => todaysEvents.filter((e) => !e.time), [todaysEvents]);
+  const timedEvents = useMemo(
+    () => todaysEvents.filter((e) => e.time).sort((a, b) => a.time.localeCompare(b.time)),
+    [todaysEvents]
+  );
+
+  const pendingTasks = useMemo(() => {
+    return combinedEvents
+      .filter((e) => e.source === 'google-task')
+      .sort((a, b) => {
+        if (!a.date && !b.date) return 0;
+        if (!a.date) return 1;
+        if (!b.date) return -1;
+        return a.date.localeCompare(b.date);
+      });
+  }, [combinedEvents]);
+
+  const nextEvent = useMemo(() => {
+    const upcoming = combinedEvents
+      .filter((e) => e.time)
+      .map((e) => ({ ...e, dt: new Date(`${e.date}T${e.time}:00`) }))
+      .filter((e) => e.dt.getTime() >= now.getTime())
+      .sort((a, b) => a.dt - b.dt);
+    return upcoming[0] || null;
+  }, [combinedEvents, now]);
+
+  let countdownStr = null;
+  if (nextEvent) {
+    const totalSeconds = Math.max(0, Math.floor((nextEvent.dt.getTime() - now.getTime()) / 1000));
+    const days = Math.floor(totalSeconds / 86400);
+    const hours = Math.floor((totalSeconds % 86400) / 3600);
+    const mins = Math.floor((totalSeconds % 3600) / 60);
+    const secs = totalSeconds % 60;
+    countdownStr = days > 0
+      ? `${days}:${pad2(hours)}:${pad2(mins)}:${pad2(secs)}`
+      : `${pad2(hours)}:${pad2(mins)}:${pad2(secs)}`;
+  }
+
+  function openAddModal() {
+    setModal({ open: true, mode: 'add', id: null, title: '', date: destKey, time: '09:00', allDay: false });
+  }
+
+  function openEditModal(ev) {
+    setModal({ open: true, mode: 'edit', id: ev.id, title: ev.title, date: ev.date, time: ev.time || '09:00', allDay: !ev.time });
+  }
+
+  function closeModal() {
+    setModal(EMPTY_MODAL);
+  }
+
+  function updateModalField(field, value) {
+    setModal((m) => ({ ...m, [field]: value }));
+  }
+
+  function saveModal() {
+    if (!modal.title.trim() || !modal.date) return;
+    const newEvent = {
+      id: modal.mode === 'add' ? uid() : modal.id,
+      title: modal.title.trim(),
+      date: modal.date,
+      time: modal.allDay ? null : modal.time,
+    };
+    setEvents((prev) => {
+      if (modal.mode === 'add') return [...prev, newEvent];
+      return prev.map((e) => (e.id === newEvent.id ? newEvent : e));
+    });
+    closeModal();
+  }
+
+  function deleteModalEvent() {
+    setEvents((prev) => prev.filter((e) => e.id !== modal.id));
+    closeModal();
+  }
+
+  return (
+    <div className="tc-app">
+      <style>{CSS}</style>
+
+      <div className="tc-header">
+        <span className="tc-header__title">TIME CIRCUITS CALENDAR</span>
+        <span className="tc-header__status">
+          <span className="tc-status-dot" />
+          MODO LOCAL
+        </span>
+      </div>
+
+      <Console>
+        <ConsoleSection label="DESTINATION TIME" colorClass="red">
+          <TimeDisplay date={destination} editable selectedField={selectedField} onSelectField={setSelectedField} blinkColon={false} />
+        </ConsoleSection>
+        <ConsoleSection label="PRESENT TIME" colorClass="green" seam>
+          <TimeDisplay date={now} editable={false} blinkColon />
+        </ConsoleSection>
+        <ConsoleSection label="LAST TIME DEPARTED" colorClass="amber" seam>
+          <TimeDisplay date={lastDeparted} editable={false} blinkColon={false} />
+        </ConsoleSection>
+      </Console>
+
+      <div className="tc-controls">
+        <button type="button" className="tc-btn tc-btn--icon" onClick={() => adjustField(selectedField, -1)} aria-label="Disminuir">−</button>
+        <span className="tc-controls__label">{FIELD_LABELS[selectedField]}</span>
+        <button type="button" className="tc-btn tc-btn--icon" onClick={() => adjustField(selectedField, 1)} aria-label="Aumentar">+</button>
+        <span className="tc-controls__gap" />
+        <button type="button" className="tc-btn tc-btn--today" onClick={goToday}>HOY</button>
+      </div>
+
+      <div className="tc-card">
+        <div className="tc-card__section">
+          <div className="tc-card__header">
+            <div className="tc-card__title">
+              EVENTOS · {MESES[destination.getMonth()]} {pad2(destination.getDate())}
+            </div>
+            <button
+              type="button"
+              className="tc-sync-btn"
+              onClick={syncGoogleCalendar}
+              disabled={syncStatus === 'loading'}
+            >
+              {syncStatus === 'loading' ? 'SINCRONIZANDO…' : '⟳ GOOGLE'}
+            </button>
+          </div>
+          <div className={`tc-sync-status${syncStatus === 'error' ? ' tc-sync-status--error' : ''}`}>
+            {syncError
+              ? syncError
+              : lastSync
+                ? `Última sincronización: ${lastSync.toLocaleTimeString('es', { hour: '2-digit', minute: '2-digit' })}`
+                : 'Toca "GOOGLE" para traer los eventos de este mes'}
+          </div>
+          {allDayEvents.length === 0 && timedEvents.length === 0 && (
+            <div className="tc-empty">SIN EVENTOS PARA ESTA FECHA</div>
+          )}
+          {allDayEvents.length > 0 && <div className="tc-allday-label">TODO EL DÍA</div>}
+          {allDayEvents.map((ev) => (
+            <EventRow key={ev.id} ev={ev} onClick={() => openEditModal(ev)} />
+          ))}
+          {timedEvents.map((ev) => (
+            <EventRow key={ev.id} ev={ev} onClick={() => openEditModal(ev)} />
+          ))}
+        </div>
+
+        {pendingTasks.length > 0 && (
+          <div className="tc-card__section tc-card__section--seam">
+            <div className="tc-card__title">TAREAS ({pendingTasks.length})</div>
+            {pendingTasks.map((task) => (
+              <TaskRow key={task.id} task={task} />
+            ))}
+          </div>
+        )}
+
+        <div className="tc-card__section tc-card__section--seam">
+          <div className="tc-card__title">PRÓXIMO EVENTO</div>
+          {nextEvent ? (
+            <div className="tc-next">
+              <div className="tc-next__info">
+                <div className="tc-next__title">{nextEvent.title}</div>
+                <div className="tc-next__time">{formatEventTime(nextEvent.time)}</div>
+              </div>
+              <div className="tc-next__countdown">T−{countdownStr}</div>
+            </div>
+          ) : (
+            <div className="tc-empty">SIN EVENTOS PROGRAMADOS</div>
+          )}
+        </div>
+      </div>
+
+      <button type="button" className="tc-fab" onClick={openAddModal} aria-label="Agregar evento">+</button>
+
+      {modal.open && (
+        <div className="tc-modal-overlay" onClick={closeModal}>
+          <div className="tc-modal" onClick={(e) => e.stopPropagation()}>
+            <div className="tc-modal__title">{modal.mode === 'add' ? 'NUEVO EVENTO' : 'EDITAR EVENTO'}</div>
+
+            <label className="tc-modal__label" htmlFor="tc-title">TÍTULO</label>
+            <input
+              id="tc-title"
+              className="tc-modal__input"
+              type="text"
+              value={modal.title}
+              onChange={(e) => updateModalField('title', e.target.value)}
+              placeholder="Ej. Grabar video"
+            />
+
+            <label className="tc-modal__label" htmlFor="tc-date">FECHA</label>
+            <input
+              id="tc-date"
+              className="tc-modal__input"
+              type="date"
+              value={modal.date}
+              onChange={(e) => updateModalField('date', e.target.value)}
+            />
+
+            <label className="tc-modal__checkbox">
+              <input type="checkbox" checked={modal.allDay} onChange={(e) => updateModalField('allDay', e.target.checked)} />
+              Todo el día
+            </label>
+
+            {!modal.allDay && (
+              <>
+                <label className="tc-modal__label" htmlFor="tc-time">HORA</label>
+                <input
+                  id="tc-time"
+                  className="tc-modal__input"
+                  type="time"
+                  value={modal.time}
+                  onChange={(e) => updateModalField('time', e.target.value)}
+                />
+              </>
+            )}
+
+            <div className="tc-modal__actions">
+              {modal.mode === 'edit' && (
+                <button type="button" className="tc-btn tc-btn--danger" onClick={deleteModalEvent}>ELIMINAR</button>
+              )}
+              <button type="button" className="tc-btn" onClick={closeModal}>CANCELAR</button>
+              <button type="button" className="tc-btn tc-btn--primary" onClick={saveModal}>GUARDAR</button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      <div className="tc-footer">Eventos locales guardados en este navegador · Google Calendar es de solo lectura</div>
+    </div>
+  );
+}
+const CSS = `
+.tc-app {
+  --tc-bg: #0b0c0d;
+  --tc-panel-1: #6b6e72;
+  --tc-panel-2: #3a3c3f;
+  --tc-panel-3: #1c1d1f;
+  --tc-red: #ff2a00;
+  --tc-green: #29e819;
+  --tc-amber: #ffa000;
+  --tc-text: #e6e7e9;
+  --tc-text-dim: #8c8f93;
+  --tc-text-faint: #45484c;
+
+  box-sizing: border-box;
+  max-width: 420px;
+  margin: 0 auto;
+  padding: 12px 10px 84px;
+  background: var(--tc-bg);
+  color: var(--tc-text);
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Arial, sans-serif;
+  position: relative;
+  min-height: 100%;
+  border-radius: 12px;
+  animation: tc-fade-in .35s ease both;
+}
+.tc-app *, .tc-app *::before, .tc-app *::after { box-sizing: border-box; }
+
+@keyframes tc-fade-in { from { opacity: 0; transform: translateY(6px); } to { opacity: 1; transform: translateY(0); } }
+
+.tc-header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 10px; padding: 0 2px; }
+.tc-header__title { font-size: .74rem; font-weight: 700; letter-spacing: .09em; color: var(--tc-text-dim); }
+.tc-header__status { font-size: .62rem; letter-spacing: .07em; color: var(--tc-text-dim); display: flex; align-items: center; gap: 5px; }
+.tc-status-dot { width: 6px; height: 6px; border-radius: 50%; background: var(--tc-green); box-shadow: 0 0 6px var(--tc-green); display: inline-block; }
+.tc-status-dot--error { background: var(--tc-red); box-shadow: 0 0 6px var(--tc-red); }
+
+/* ---- Bloque único de los 3 relojes, sin separaciones entre ellos ---- */
+.tc-console {
+  position: relative;
+  overflow: hidden;
+  background: linear-gradient(150deg, var(--tc-panel-1), var(--tc-panel-2) 55%, var(--tc-panel-3));
+  border: 1px solid rgba(0,0,0,.6);
+  border-radius: 8px;
+  box-shadow: 0 8px 18px rgba(0,0,0,.55), inset 0 1px 0 rgba(255,255,255,.07);
+  margin-bottom: 10px;
+}
+.tc-console::before {
+  content: '';
+  position: absolute;
+  inset: 0;
+  background: repeating-linear-gradient(115deg, rgba(255,255,255,.045) 0 2px, transparent 2px 7px);
+  pointer-events: none;
+}
+.tc-console__section { position: relative; z-index: 1; }
+.tc-console__section--seam { box-shadow: inset 0 3px 4px -1px rgba(0,0,0,.65); }
+.tc-console__section--seam::before {
+  content: '';
+  display: block;
+  height: 1px;
+  background: rgba(255,255,255,.08);
+}
+.tc-panel--red { --tc-accent: var(--tc-red); }
+.tc-panel--green { --tc-accent: var(--tc-green); }
+.tc-panel--amber { --tc-accent: var(--tc-amber); }
+
+.tc-screw {
+  position: absolute;
+  z-index: 2;
+  width: 7px; height: 7px; border-radius: 50%;
+  background: radial-gradient(circle at 35% 35%, #d4d7db, #6d7075 65%, #303234);
+  box-shadow: 0 1px 1px rgba(0,0,0,.7);
+}
+.tc-screw--tl { top: 6px; left: 6px; }
+.tc-screw--tr { top: 6px; right: 6px; }
+.tc-screw--bl { bottom: 6px; left: 6px; }
+.tc-screw--br { bottom: 6px; right: 6px; }
+
+.tc-console__row {
+  display: flex;
+  flex-wrap: nowrap;
+  align-items: flex-end;
+  justify-content: center;
+  gap: 4px;
+  padding: 8px 8px 6px;
+}
+.tc-console__title {
+  background: linear-gradient(#241010, #120707);
+  color: #f5efe9;
+  text-align: center;
+  font-weight: 700;
+  letter-spacing: .13em;
+  font-size: .62rem;
+  padding: 5px 0;
+  border-top: 1px solid #4a1c1c;
+}
+
+.tc-module { display: flex; flex-direction: column; align-items: center; gap: 2px; flex: 0 1 auto; min-width: 0; }
+.tc-module__label {
+  background: linear-gradient(#7a2020, #4a1010);
+  border: 1px solid #2c0a0a;
+  color: #f2dccb;
+  font-size: .44rem;
+  font-weight: 700;
+  letter-spacing: .04em;
+  padding: 1px 4px;
+  border-radius: 2px;
+  white-space: nowrap;
+}
+.tc-module__value {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  background: #020202;
+  border: 2px solid #202124;
+  box-shadow: 0 0 0 1px #08090a, inset 0 2px 5px rgba(0,0,0,.95);
+  border-radius: 3px;
+  min-width: 2.1em;
+  padding: 2px 4px;
+  text-align: center;
+  overflow: hidden;
+  font-family: 'Consolas', 'SFMono-Regular', Menlo, 'Roboto Mono', monospace;
+  font-weight: 800;
+  letter-spacing: 0;
+  font-size: clamp(.85rem, 4vw, 1.15rem);
+  color: var(--tc-accent);
+}
+.tc-module__value .tc-glyph {
+  display: inline-block;
+  transform: skewX(-14deg) scaleY(1.06);
+  text-shadow: 0 0 3px currentColor, 0 0 7px currentColor, 0 0 13px currentColor;
+}
+.tc-module__value--interactive { cursor: pointer; }
+.tc-module__value--interactive:hover { filter: brightness(1.2); }
+.tc-module__value--selected { outline: 2px solid var(--tc-accent); outline-offset: 1px; }
+
+.tc-ampm-module { display: flex; flex-direction: column; justify-content: center; gap: 1px; padding-bottom: 2px; flex: 0 0 auto; }
+.tc-ampm-module--interactive { cursor: pointer; }
+.tc-ampm-module__row { display: flex; align-items: center; gap: 2px; }
+.tc-lamp { width: 5px; height: 5px; border-radius: 50%; background: #4a1414; box-shadow: inset 0 0 2px rgba(0,0,0,.85); flex-shrink: 0; }
+.tc-lamp--lit { background: #ffd35c; box-shadow: 0 0 4px #ffd35c, 0 0 7px #ffb020; }
+.tc-ampm-module__text { font-size: .46rem; font-weight: 700; letter-spacing: .03em; color: #c9ccd0; }
+
+.tc-clock-colon { display: flex; flex-direction: column; gap: 3px; justify-content: center; padding-bottom: 6px; flex: 0 0 auto; }
+.tc-dot { width: 4px; height: 4px; border-radius: 50%; background: var(--tc-accent); box-shadow: 0 0 3px currentColor; }
+.tc-dot--blink { animation: tc-blink 1s steps(1, end) infinite; }
+@keyframes tc-blink { 50% { opacity: .15; } }
+
+/* ---- Controles compactos en una sola fila ---- */
+.tc-controls { display: flex; align-items: center; justify-content: center; gap: 6px; margin-bottom: 10px; }
+.tc-controls__label { font-size: .64rem; font-weight: 700; letter-spacing: .06em; color: var(--tc-text-dim); min-width: 46px; text-align: center; }
+.tc-controls__gap { width: 10px; }
+
+.tc-btn {
+  background: linear-gradient(#3d3f43, #222325);
+  border: 1px solid #56585c;
+  border-radius: 6px;
+  color: #d8dadd;
+  padding: 7px 11px;
+  font-size: .68rem;
+  font-weight: 700;
+  letter-spacing: .03em;
+  box-shadow: 0 2px 0 rgba(0,0,0,.5);
+  cursor: pointer;
+}
+.tc-btn:active { transform: translateY(1px); box-shadow: 0 1px 0 rgba(0,0,0,.5); }
+.tc-btn--icon { width: 36px; padding: 7px 0; font-size: .95rem; }
+.tc-btn--today { border-color: var(--tc-green); color: var(--tc-green); }
+.tc-btn--primary { background: linear-gradient(#2f6b3f, #1c4227); border-color: #3f8a53; color: #d9ffe4; }
+.tc-btn--danger { background: linear-gradient(#6b2f2f, #421c1c); border-color: #8a3f3f; color: #ffd9d9; margin-right: auto; }
+
+/* ---- Sincronización con Google Calendar ---- */
+.tc-card__header { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-bottom: 4px; }
+.tc-card__header .tc-card__title { margin-bottom: 0; flex: 1; }
+.tc-sync-btn {
+  flex-shrink: 0;
+  background: linear-gradient(#3a5aa8, #223a72);
+  border: 1px solid #5a7ad0;
+  color: #eaf0ff;
+  font-size: .62rem;
+  font-weight: 700;
+  letter-spacing: .04em;
+  padding: 6px 10px;
+  border-radius: 6px;
+  cursor: pointer;
+}
+.tc-sync-btn:active { transform: translateY(1px); }
+.tc-sync-btn:disabled { opacity: .65; cursor: default; }
+.tc-sync-status { font-size: .6rem; color: var(--tc-text-faint); letter-spacing: .02em; margin-bottom: 6px; word-break: break-word; }
+.tc-sync-status--error { color: #ff8080; }
+.tc-event-row--google { cursor: default; }
+.tc-event-row--google:active { background: none; }
+.tc-event-row__badge {
+  font-size: .58rem;
+  font-weight: 700;
+  color: #a9c0ff;
+  border: 1px solid #4a5a78;
+  border-radius: 3px;
+  padding: 0 4px;
+  flex-shrink: 0;
+}
+.tc-event-row__badge--task {
+  color: #ffcf8a;
+  border-color: #7a5a30;
+}
+
+/* ---- Tarjeta única: eventos + próximo evento ---- */
+.tc-card { background: var(--tc-panel-3); border: 1px solid rgba(255,255,255,.06); border-radius: 10px; margin-bottom: 10px; overflow: hidden; }
+.tc-card__section { padding: 10px 12px 4px; }
+.tc-card__section--seam { border-top: 1px solid rgba(255,255,255,.07); padding-top: 10px; padding-bottom: 10px; }
+.tc-card__title { font-size: .62rem; font-weight: 700; letter-spacing: .07em; color: var(--tc-text-dim); margin-bottom: 5px; }
+.tc-allday-label { font-size: .58rem; letter-spacing: .07em; color: var(--tc-text-faint); margin: 3px 0 1px; }
+.tc-empty { font-size: .7rem; color: var(--tc-text-faint); padding: 6px 0 10px; text-align: center; }
+.tc-event-row {
+  width: 100%;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  background: none;
+  border: none;
+  border-bottom: 1px solid rgba(255,255,255,.06);
+  padding: 8px 2px;
+  color: var(--tc-text);
+  text-align: left;
+  cursor: pointer;
+  font-size: .76rem;
+}
+.tc-event-row:last-child { border-bottom: none; }
+.tc-event-row:active { background: rgba(255,255,255,.04); }
+.tc-event-row__time { font-family: 'Consolas', monospace; color: var(--tc-green); font-size: .66rem; min-width: 70px; flex-shrink: 0; }
+.tc-event-row__title { flex: 1; }
+
+.tc-next { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
+.tc-next__title { font-size: .82rem; font-weight: 700; }
+.tc-next__time { font-size: .68rem; color: var(--tc-text-dim); }
+.tc-next__countdown {
+  font-family: 'Consolas', monospace;
+  font-weight: 700;
+  font-size: 1.05rem;
+  color: var(--tc-red);
+  text-shadow: 0 0 3px currentColor, 0 0 8px currentColor;
+  flex-shrink: 0;
+}
+
+.tc-fab {
+  position: fixed;
+  bottom: 20px;
+  right: max(18px, calc((100% - 420px) / 2 + 18px));
+  width: 50px;
+  height: 50px;
+  border-radius: 50%;
+  background: radial-gradient(circle at 35% 30%, #3f4247, #1c1d1f 70%);
+  border: 1px solid #5a5d61;
+  color: var(--tc-green);
+  font-size: 1.6rem;
+  line-height: 1;
+  box-shadow: 0 6px 14px rgba(0,0,0,.6), inset 0 0 0 1px rgba(255,255,255,.05);
+  text-shadow: 0 0 6px currentColor;
+  cursor: pointer;
+}
+.tc-fab:active { transform: translateY(1px); }
+
+.tc-modal-overlay { position: fixed; inset: 0; background: rgba(0,0,0,.6); display: flex; align-items: flex-end; justify-content: center; z-index: 50; padding: 0; }
+.tc-modal { width: 100%; max-width: 420px; background: var(--tc-panel-2); border-top: 1px solid rgba(255,255,255,.08); border-radius: 16px 16px 0 0; padding: 16px 16px 20px; }
+.tc-modal__title { font-size: .78rem; font-weight: 700; letter-spacing: .07em; color: var(--tc-text-dim); margin-bottom: 10px; }
+.tc-modal__label { display: block; font-size: .6rem; font-weight: 700; letter-spacing: .07em; color: var(--tc-text-faint); margin: 9px 0 4px; }
+.tc-modal__input { width: 100%; background: #030303; border: 1px solid #45484c; border-radius: 6px; padding: 8px 9px; color: var(--tc-text); font-size: .82rem; }
+.tc-modal__checkbox { display: flex; align-items: center; gap: 8px; font-size: .76rem; color: var(--tc-text-dim); margin: 10px 0 2px; }
+.tc-modal__actions { display: flex; gap: 8px; margin-top: 14px; }
+
+.tc-footer { text-align: center; font-size: .58rem; color: var(--tc-text-faint); margin-top: 2px; padding: 0 8px; }
+
+.tc-app button:focus-visible, .tc-app [tabindex]:focus-visible { outline: 2px solid #fff; outline-offset: 2px; }
+
+@media (prefers-reduced-motion: reduce) {
+  .tc-app, .tc-dot--blink { animation: none !important; }
+}
+`;
+
+const root = ReactDOM.createRoot(document.getElementById('root'));
+root.render(<TimeCircuitsCalendar />);
+</script>
+<script>
+  (function () {
+    var source = document.getElementById('app-source').textContent;
+    var compiled = Babel.transform(source, {
+      presets: [['react', { runtime: 'classic' }]],
+      sourceType: 'script',
+      filename: 'app.jsx',
+    }).code;
+    var script = document.createElement('script');
+    script.text = compiled;
+    document.body.appendChild(script);
+  })();
+</script>
+</body>
+</html>
